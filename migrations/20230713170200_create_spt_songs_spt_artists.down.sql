@@ -1,0 +1,1 @@
+DROP TABLE spt_songs_spt_artists
