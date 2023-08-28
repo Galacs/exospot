@@ -1,11 +1,22 @@
+use anyhow::anyhow;
 use bytes::Bytes;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, self},
+    terminal::{
+        self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use futures::stream::TryStreamExt;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Span, Spans},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
 use rspotify::{
     model::{AlbumId, PlayableItem, PlaylistId},
     prelude::*,
@@ -13,8 +24,14 @@ use rspotify::{
 };
 use sqlx::SqliteConnection;
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqlitePool};
-use std::{io::{self, Stdout}, error::Error, time::Duration};
-use ratatui::{backend::CrosstermBackend, Terminal, widgets::{Paragraph, Block, Borders}, layout::{Constraint, Layout, Direction, Alignment}, text::{Spans, Span}, style::{Style, Color, Modifier}};
+use std::{
+    error::Error,
+    io::{self, Stdout},
+    process::exit,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{select, sync::Mutex};
 
 use viuer::{print, Config};
 
@@ -33,31 +50,34 @@ fn restore_terminal(
     Ok(terminal.show_cursor()?)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum App {
     Welcome,
     Spotify(SpotifyUi),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SpotifyUi {
     title: String,
     artist: String,
     cover_img: Bytes,
     album_name: String,
-    album_kind: String
+    album_kind: String,
+    duration: Duration,
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &App) -> Result<Option<KeyCode>, Box<dyn Error>> {
-    loop {
-        terminal.draw(|frame| {
-            match app {
-                App::Welcome => {
-                    let greeting = Paragraph::new("Welcome to Exospot");
-                    frame.render_widget(greeting, frame.size());
-                },
-                App::Spotify(spt_ui) => {
-                    let chunks = Layout::default()
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+) -> Result<(), Box<dyn Error>> {
+    terminal.draw(|frame| {
+        match app {
+            App::Welcome => {
+                let greeting = Paragraph::new("Welcome to Exospot");
+                frame.render_widget(greeting, frame.size());
+            }
+            App::Spotify(spt_ui) => {
+                let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     // .margin(0)
                     .constraints(
@@ -71,84 +91,151 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &App) -> Result<O
                     )
                     .split(frame.size());
 
-                    let chunks2 = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Ratio(1, 4), Constraint::Ratio(2, 4), Constraint::Ratio(3, 4)].as_ref())
-                        .split(chunks[3]);
-                
-                
-                    let title = Paragraph::new(format!("Titre: {}", spt_ui.title)).alignment(Alignment::Center);
-                    frame.render_widget(title, chunks[1]);
-                    let title = Paragraph::new(format!("Artiste: {}\nAlbum: {} ({})", spt_ui.artist, spt_ui.album_name, spt_ui.album_kind)).alignment(Alignment::Center);
-                    frame.render_widget(title, chunks[2]);
-                    let title = Paragraph::new("Y pour faire ca").alignment(Alignment::Center);
-                    frame.render_widget(title, chunks2[0]);
-                    let title = Paragraph::new("Y pour ouvrir dans Youtube Search").alignment(Alignment::Center);
-                    frame.render_widget(title, chunks2[1]);
-                    let title = Paragraph::new("Entrée pour aller sur la musique suivante").alignment(Alignment::Center);
-                    frame.render_widget(title, chunks2[2]);
-                    
-                    let img = image::load_from_memory(&spt_ui.cover_img).expect("Data from stdin could not be decoded.");
-                    let conf = Config {
-                        width: Some(50),
-                        height: Some(50),
-                        x: 10,
-                        y: 4,
-                        ..Default::default()
-                    };
-                    // print(&img, &conf).expect("Image printing failed.");
-                },
-            }
-            
-        })?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        restore_terminal(terminal).unwrap();
-                        panic!();
-                    },
-                    _ => {
-                        return Ok(Some(key.code))
-                    }
-                }
-                
+                let chunks2 = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(
+                        [
+                            Constraint::Ratio(1, 4),
+                            Constraint::Ratio(2, 4),
+                            Constraint::Ratio(3, 4),
+                        ]
+                        .as_ref(),
+                    )
+                    .split(chunks[3]);
+
+                let pretty_duration = format!("{}", chrono::Duration::from_std(spt_ui.duration).unwrap().display_timestamp().unwrap());
+                let title =
+                    Paragraph::new(format!("Titre: {}\nDurée: {}", spt_ui.title, pretty_duration)).alignment(Alignment::Center);
+                frame.render_widget(title, chunks[1]);
+                let title = Paragraph::new(format!(
+                    "Artiste: {}\nAlbum: {} ({})",
+                    spt_ui.artist, spt_ui.album_name, spt_ui.album_kind
+                ))
+                .alignment(Alignment::Center);
+                frame.render_widget(title, chunks[2]);
+                let title = Paragraph::new("Y pour faire ca").alignment(Alignment::Center);
+                frame.render_widget(title, chunks2[0]);
+                let title = Paragraph::new("Y pour ouvrir dans Youtube Search")
+                    .alignment(Alignment::Center);
+                frame.render_widget(title, chunks2[1]);
+                let title = Paragraph::new("Entrée pour aller sur la musique suivante")
+                    .alignment(Alignment::Center);
+                frame.render_widget(title, chunks2[2]);
+
+                let img = image::load_from_memory(&spt_ui.cover_img)
+                    .expect("Data from stdin could not be decoded.");
+                let conf = Config {
+                    width: Some(20),
+                    height: Some(10),
+                    x: 10,
+                    y: 4,
+                    use_kitty: false,
+                    ..Default::default()
+                };
+                print(&img, &conf).expect("Image printing failed.");
             }
         }
-    }
-    Ok(None)
+    })?;
+    Ok(())
 }
 
-fn pause() {
-    use std::io::prelude::*;
-    let mut stdin = io::stdin();
-    let mut stdout = io::stdout();
+trait DisplayTimestamp {
+    fn display_timestamp(&self) -> Result<String, anyhow::Error>;
+}
 
-    // We want the cursor to stay at the end of the line, so we print without a newline and flush manually.
-    write!(stdout, "Press any key to continue...").unwrap();
-    stdout.flush().unwrap();
+impl DisplayTimestamp for chrono::Duration {
+    fn display_timestamp(&self) -> Result<String, anyhow::Error> {
+        let mut a = chrono::Duration::from(*self);
+        let minutes = a.num_minutes();
+        a = a - chrono::Duration::from_std(std::time::Duration::from_secs((a.num_minutes()*60) as u64))?;
+        let seconds = a.num_seconds();
+        Ok(format!("{minutes:0>2}:{seconds:0>2}"))
+    }
+}
 
-    // Read a single byte and discard
-    let _ = stdin.read(&mut [0u8]).unwrap();
+async fn input(
+    tx: tokio::sync::mpsc::Sender<Event>,
+    update_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut reader = EventStream::new();
+    loop {
+        let event = reader.next().await;
+        let Some(event) = event else { continue };
+        let Ok(event) = event else { continue };
+        match event {
+            Event::FocusGained => {}
+            Event::FocusLost => {}
+            Event::Key(key) => match key.code {
+                KeyCode::Char('q') => break,
+                _ => {}
+            },
+            Event::Mouse(_) => {}
+            Event::Paste(_) => {}
+            Event::Resize(_, _) => {
+                update_tx.send(true).unwrap();
+            }
+        }
+        tx.send(event).await.unwrap();
+    }
+}
+
+async fn ui(
+    term: Arc<Mutex<Terminal<CrosstermBackend<Stdout>>>>,
+    mut rx: tokio::sync::watch::Receiver<App>,
+    mut update_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut state = rx.borrow().to_owned();
+    loop {
+        select! {
+            _ = rx.changed() => state = rx.borrow().to_owned(),
+            _ = update_rx.changed() => {},
+        }
+        let mut terminal = term.lock().await;
+        draw(&mut terminal, &state).unwrap();
+    }
 }
 
 #[tokio::main]
 async fn main() {
+    // Restore terminal on panic
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut terminal = setup_terminal().unwrap();
+        default_panic(info);
+        restore_terminal(&mut terminal).unwrap();
+    }));
+
     // TUI
-    let mut terminal = setup_terminal().unwrap();
-    run(&mut terminal, &App::Welcome).unwrap();
+    let  terminal = setup_terminal().unwrap();
+    let  app_state: App = App::Welcome;
+    let (tx, rx) = tokio::sync::watch::channel(app_state.clone());
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+    let (update_tx, update_rx) = tokio::sync::watch::channel(true);
+    let terminal = Arc::new(Mutex::new(terminal));
+    let task = tokio::task::spawn(ui(terminal.clone(), rx, update_rx));
+    let input_task = tokio::task::spawn(input(input_tx, update_tx));
+
+    let term = terminal.clone();
+    tokio::spawn(async move {
+        select! {
+            _ = task => {},
+            _ = input_task => {}
+        }
+        let mut terminal = term.lock().await;
+        restore_terminal(&mut terminal).unwrap();
+        exit(0);
+    });
 
     // SQL pool
     let database_url = "sqlite://songs.db";
-    let mut conn = SqlitePool::connect(database_url).await.unwrap();
+    let conn = SqlitePool::connect(database_url).await.unwrap();
     sqlx::migrate!().run(&conn).await.unwrap();
-
     // sync_from_spotify(&conn).await;
 
-    // let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    
 
-    let spt_songs = sqlx::query!("select * from spt_songs").fetch_all(&conn).await;
+    let spt_songs = sqlx::query!("select * from spt_songs")
+        .fetch_all(&conn)
+        .await;
     for song in spt_songs.unwrap() {
         let artists = sqlx::query!(
             "SELECT spt_artists.name, spt_artists.id
@@ -168,17 +255,32 @@ async fn main() {
         let image = sqlx::query!(
             "SELECT URL FROM spt_albums_covers WHERE album_id = ? ORDER BY height DESC",
             song.album
-        ).fetch_one(&conn).await.unwrap();
-        // rx2.recv().await.unwrap();
-        // tx.send(App::Spotify(SpotifyUi { title: song.title, artist: song.artist })).unwrap();
-        let mut buf = reqwest::get(image.url).await.unwrap().bytes().await.unwrap();
-        loop {   
-            if let Some(key) = run(&mut terminal, &App::Spotify(SpotifyUi {title:song.title.to_owned(),artist:song.artist.to_owned(),cover_img:buf.to_owned(), album_name: album.name.to_owned(), album_kind: album.kind.to_owned() })).unwrap() {
-                match key {
-                    KeyCode::Enter => break,
-                    KeyCode::Char('y') => {
-                        open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string());
-                    }
+        )
+        .fetch_one(&conn)
+        .await
+        .unwrap();
+        let img_buf = reqwest::get(image.url)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let app_state = App::Spotify(SpotifyUi {
+            title: song.title.to_owned(),
+            artist: song.artist.to_owned(),
+            cover_img: img_buf,
+            album_name: album.name.to_owned(),
+            album_kind: album.kind.to_owned(),
+            duration: Duration::from_millis(song.duration as u64)
+        });
+        tx.send(app_state).unwrap();
+
+        'outer: loop {
+            while let Some(i) = input_rx.recv().await {
+                let Event::Key(key) = i else { continue };
+                match key.code {
+                    KeyCode::Enter => break 'outer,
+                    KeyCode::Char('y') => { open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string()).unwrap(); }
                     _ => {}
                 }
             }
@@ -192,35 +294,10 @@ async fn main() {
         // println!("Album type: {}", album.kind);
 
         // println!("Biggest cover image url: {}", image.url);
-
-        // pause();
     }
 
-    // let results = sqlx::query!("select id from spt_artists")
-    //     .fetch_all(&conn)
-    //     .await;
-    // dbg!(results);
-
-    // let results = sqlx::query!("select id from spt_songs")
-    //     .fetch_all(&conn)
-    //     .await;
-    // dbg!(results);
-
-    // let results = sqlx::query!("SELECT * from spt_songs_spt_artists")
-    //     .fetch_all(&conn)
-    //     .await;
-    // dbg!(results);
-
-    // let results = sqlx::query!("SELECT name
-    //     FROM spt_songs_spt_artists
-    //     INNER JOIN spt_songs ON spt_songs_spt_artists.spt_song_id = spt_songs.id
-    //     INNER JOIN spt_artists ON spt_songs_spt_artists.spt_artist_id = spt_artists.id
-    //     WHERE spt_song_id = '1HVKbxwcF6VeP7n9CBzO9k'")
-    //     .fetch_all(&conn)
-    //     .await;
-    // dbg!(results);
-
     conn.close().await;
+    let mut terminal = terminal.lock().await;
     restore_terminal(&mut terminal).unwrap();
 }
 
@@ -235,6 +312,9 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
         None,
     );
 
+    // let mut ids = std::collections::HashSet::new();
+    // let data = std::sync::Arc::new(std::sync::Mutex::new(ids));
+
     playlist.try_for_each_concurrent(10, |item| async {
         if let Some(playable) = item.track {
             if let PlayableItem::Track(track) = playable {
@@ -244,6 +324,8 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                 let artist = track.artists.first().unwrap().name.to_owned();
                 let album_id = track.album.id.unwrap().to_string();
                 let album_type = track.album.album_type.unwrap();
+                let duration_ms = track.duration.num_milliseconds();
+
                 if let Ok(_) = sqlx::query!("INSERT INTO spt_albums(id, name, kind) VALUES ($1, $2, $3)", album_id, track.album.name, album_type).execute(conn).await {
                     for image in &track.album.images {
                         sqlx::query!("INSERT INTO spt_albums_covers(album_id, url, height, width) VALUES ($1, $2, $3, $4)",
@@ -251,11 +333,12 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                     }
                 }
                 if let Ok(_) = sqlx::query!(
-                    "INSERT INTO spt_songs(id, title, artist, album) VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO spt_songs(id, title, artist, album, duration) VALUES ($1, $2, $3, $4, $5)",
                     id,
                     title,
                     artist,
-                    album_id
+                    album_id,
+                    duration_ms
                 ).execute(conn).await {
                     for i in &track.artists {
                         let a = &i.id.clone().unwrap().to_string();
@@ -269,6 +352,10 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                         sqlx::query!("INSERT INTO spt_songs_spt_artists(spt_song_id, spt_artist_id) VALUES ($1, $2)", id, a).execute(conn).await;
                     }
                 }
+                // let mut ids = data.lock().unwrap();
+                // if !ids.insert(title.to_owned()) {
+                //     println!("{}    {}      {}", id, title, artist)
+                // }
             }
         }
         Ok(())

@@ -1,5 +1,6 @@
 CREATE TABLE spt_songs (
   id VARCHAR NOT NULL PRIMARY KEY,
   title VARCHAR NOT NULL,
-  artist VARCHAR NOT NULL
+  artist VARCHAR NOT NULL,
+  duration INTEGER NOT NULL
 )
