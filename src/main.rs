@@ -110,7 +110,7 @@ fn draw(
                 let pretty_duration = format!("{}", chrono::Duration::from_std(spt_ui.duration).unwrap().display_timestamp().unwrap());
                 let title =
                     Paragraph::new(format!("Titre: {}\nDurée: {}", spt_ui.title, pretty_duration)).alignment(Alignment::Center);
-                frame.render_widget(title, chunks[1]);
+                frame.render_widget(title, chunks[0]);
                 let title = Paragraph::new(format!(
                     "Artiste: {}\nAlbum: {} ({})",
                     spt_ui.artist, spt_ui.album_name, spt_ui.album_kind
@@ -128,11 +128,11 @@ fn draw(
 
                 let img = image::load_from_memory(&spt_ui.cover_img)
                     .expect("Data from stdin could not be decoded.");
+                let width = (frame.size().width as f32 * 0.20_f32) as u32;
                 let conf = Config {
-                    width: Some(20),
-                    height: Some(10),
-                    x: 10,
-                    y: 4,
+                    width: Some(width),
+                    x: (frame.size().width as f32 * 0.5 - (width/2) as f32) as u16,
+                    y: (frame.size().height as f32 * 0.07) as i16,
                     use_kitty: false,
                     ..Default::default()
                 };
