@@ -8,7 +8,7 @@ use crossterm::{
     },
 };
 use futures::stream::TryStreamExt;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, AsyncReadExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
+use rodio::{Source, Sink};
 use rspotify::{
     model::{AlbumId, PlayableItem, PlaylistId},
     prelude::*,
@@ -24,9 +25,10 @@ use rspotify::{
 };
 use sqlx::SqliteConnection;
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqlitePool};
+use symphonia::core::io::MediaSource;
 use std::{
     error::Error,
-    io::{self, Stdout},
+    io::{self, Stdout, Read},
     process::exit,
     sync::Arc,
     time::Duration,
@@ -34,6 +36,8 @@ use std::{
 use tokio::{select, sync::Mutex};
 
 use viuer::{print, Config};
+
+mod symphonia_decoder;
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, Box<dyn Error>> {
     let mut stdout = io::stdout();
@@ -113,7 +117,7 @@ fn draw(
                 ))
                 .alignment(Alignment::Center);
                 frame.render_widget(title, chunks[2]);
-                let title = Paragraph::new("Y pour faire ca").alignment(Alignment::Center);
+                let title = Paragraph::new("P pour preview").alignment(Alignment::Center);
                 frame.render_widget(title, chunks2[0]);
                 let title = Paragraph::new("Y pour ouvrir dans Youtube Search")
                     .alignment(Alignment::Center);
@@ -195,6 +199,62 @@ async fn ui(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StreamStatus {
+    Play,
+}
+
+async fn stream_and_play_mp3(mp3_url: String, mut rx: tokio::sync::watch::Receiver<StreamStatus>, stream_handle: rodio::OutputStreamHandle) {
+    struct Reader<R>(futures_util::io::BufReader<R>);
+
+    impl<R: futures_util::AsyncRead + std::marker::Unpin> Read for Reader<R> {
+        fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+            use futures::executor;
+            executor::block_on(async {
+                self.0.read(&mut buf).await
+            })
+        }
+    }
+    impl<R: futures_util::AsyncRead> std::io::Seek for Reader<R> {
+        fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+            unimplemented!()
+        }
+    }
+
+    impl<R: futures_util::AsyncRead + std::marker::Unpin + std::marker::Send + std::marker::Sync> MediaSource for Reader<R> {
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+    }
+    
+    use symphonia::core::io::MediaSourceStream;
+
+    let sink = Sink::try_new(&stream_handle).unwrap();
+    while rx.changed().await.is_ok() {
+        let status = rx.borrow().clone();
+        match status {
+            StreamStatus::Play => {
+                if !sink.empty() {
+                    sink.stop();
+                    continue
+                }
+                let response = reqwest::get(&mp3_url).await.unwrap();
+                let stream = response.bytes_stream().map_err(|e| futures::io::Error::new(futures::io::ErrorKind::Other, e)).into_async_read();
+                let reader = Reader(futures_util::io::BufReader::new(stream));
+                let mss = MediaSourceStream::new(Box::new(reader), Default::default());
+                let decoder = tokio::task::spawn_blocking(|| {
+                    symphonia_decoder::SymphoniaDecoder::new(mss, Some("mp3")).unwrap()
+                }).await.unwrap();
+                sink.append(decoder);
+            },
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Restore terminal on panic
@@ -233,7 +293,7 @@ async fn main() {
     // sync_from_spotify(&conn).await;
 
 
-    let spt_songs = sqlx::query!("select * from spt_songs")
+    let spt_songs = sqlx::query!("select * from spt_songs ORDER BY RANDOM()")
         .fetch_all(&conn)
         .await;
     for song in spt_songs.unwrap() {
@@ -273,15 +333,27 @@ async fn main() {
             album_kind: album.kind.to_owned(),
             duration: Duration::from_millis(song.duration as u64)
         });
+        let url = song.preview_url;
         tx.send(app_state).unwrap();
 
+        
+
+        let (preview_tx, preview_rx) = tokio::sync::watch::channel(StreamStatus::Play);
+        let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+        if let Some(url) = url.clone() {
+            tokio::task::spawn(stream_and_play_mp3(url, preview_rx, stream_handle));
+        }
+
         'outer: loop {
-            while let Some(i) = input_rx.recv().await {
-                let Event::Key(key) = i else { continue };
-                match key.code {
-                    KeyCode::Enter => break 'outer,
-                    KeyCode::Char('y') => { open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string()).unwrap(); }
-                    _ => {}
+            select! {
+                Some(msg) = input_rx.recv() => {
+                    let Event::Key(key) = msg else { continue };
+                    match key.code {
+                        KeyCode::Enter => break 'outer,
+                        KeyCode::Char('y') => { open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string()).unwrap(); }
+                        KeyCode::Char('p') => { if let Some(_) = url { preview_tx.send(StreamStatus::Play).unwrap() }}
+                        _ => {}
+                    }
                 }
             }
         }
@@ -325,6 +397,7 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                 let album_id = track.album.id.unwrap().to_string();
                 let album_type = track.album.album_type.unwrap();
                 let duration_ms = track.duration.num_milliseconds();
+                let preview_url = track.preview_url;
 
                 if let Ok(_) = sqlx::query!("INSERT INTO spt_albums(id, name, kind) VALUES ($1, $2, $3)", album_id, track.album.name, album_type).execute(conn).await {
                     for image in &track.album.images {
@@ -333,12 +406,13 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                     }
                 }
                 if let Ok(_) = sqlx::query!(
-                    "INSERT INTO spt_songs(id, title, artist, album, duration) VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO spt_songs(id, title, artist, album, duration, preview_url) VALUES ($1, $2, $3, $4, $5, $6)",
                     id,
                     title,
                     artist,
                     album_id,
-                    duration_ms
+                    duration_ms,
+                    preview_url
                 ).execute(conn).await {
                     for i in &track.artists {
                         let a = &i.id.clone().unwrap().to_string();
