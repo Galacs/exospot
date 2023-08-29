@@ -15,7 +15,7 @@ async-stream = { version = "0.3.2", optional = true }
 viuer = { version = "0.6", features = ["sixel"] }
 reqwest = { version = "0.11", features = ["stream"] }
 image = "0.24.6"
-ratatui = { version = "0.21.0", features = ["all-widgets"]}
+ratatui = { version = "0.23.0", features = ["all-widgets"]}
 crossterm = { version = "0.25", features = ["event-stream"] }
 bytes = "1"
 open = "5"
@@ -25,3 +25,4 @@ chrono = "0.4.26"
 rodio = {version = "0.17.1", features = ["symphonia-mp3"] }
 minimp3 = "0.5.1"
 symphonia = { version = "0.5.3", features = ["mp3"] }
+ratatu-image = {version = "0.1.1", features = ["crossterm", "sixel"] }
