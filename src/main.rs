@@ -351,7 +351,7 @@ async fn main() {
                     match key.code {
                         KeyCode::Enter => break 'outer,
                         KeyCode::Char('y') => { open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string()).unwrap(); }
-                        KeyCode::Char('p') => { if let Some(_) = url { preview_tx.send(StreamStatus::Play).unwrap() }}
+                        KeyCode::Char('p') | KeyCode::Char(' ') => { if let Some(_) = url { preview_tx.send(StreamStatus::Play).unwrap() }}
                         _ => {}
                     }
                 }
