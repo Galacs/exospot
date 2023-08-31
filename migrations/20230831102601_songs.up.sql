@@ -1,0 +1,5 @@
+CREATE TABLE songs (
+  id BLOB NOT NULL PRIMARY KEY
+);
+ALTER TABLE spt_songs 
+  ADD song VARCHAR(12) NOT NULL REFERENCES songs(id)

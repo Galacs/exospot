@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use base64::Engine;
 use bytes::Bytes;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode},
@@ -331,7 +332,6 @@ async fn main() {
     sqlx::migrate!().run(&conn).await.unwrap();
     // sync_from_spotify(&conn).await;
 
-
     let spt_songs = sqlx::query!("select * from spt_songs ORDER BY RANDOM()")
         .fetch_all(&conn)
         .await
@@ -451,8 +451,8 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
         None,
     );
 
-    // let mut ids = std::collections::HashSet::new();
-    // let data = std::sync::Arc::new(std::sync::Mutex::new(ids));
+    let mut ids = std::collections::HashSet::new();
+    let data = std::sync::Arc::new(std::sync::Mutex::new(ids));
 
     playlist.try_for_each_concurrent(10, |item| async {
         if let Some(playable) = item.track {
@@ -466,20 +466,30 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                 let duration_ms = track.duration.num_milliseconds();
                 let preview_url = track.preview_url;
 
+                // Check if the song is already in the db
+                if let Some(_) = sqlx::query!("SELECT id FROM spt_songs where id = $1", id).fetch_optional(conn).await.unwrap() {
+                    return Ok(())
+                }
+
                 if let Ok(_) = sqlx::query!("INSERT INTO spt_albums(id, name, kind) VALUES ($1, $2, $3)", album_id, track.album.name, album_type).execute(conn).await {
                     for image in &track.album.images {
                         sqlx::query!("INSERT INTO spt_albums_covers(album_id, url, height, width) VALUES ($1, $2, $3, $4)",
                         album_id, image.url, image.height, image.width).execute(conn).await;
                     }
                 }
+                let rnd = rand::random::<[u8; 8]>();
+                let rnd = base64::engine::general_purpose::STANDARD_NO_PAD.encode(rnd);
+                // dbg!(&rnd);
+                sqlx::query!("INSERT INTO songs(id) VALUES ($1)", rnd).execute(conn).await.unwrap();
                 if let Ok(_) = sqlx::query!(
-                    "INSERT INTO spt_songs(id, title, artist, album, duration, preview_url) VALUES ($1, $2, $3, $4, $5, $6)",
+                    "INSERT INTO spt_songs(id, title, artist, album, duration, preview_url, song) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                     id,
                     title,
                     artist,
                     album_id,
                     duration_ms,
-                    preview_url
+                    preview_url,
+                    rnd
                 ).execute(conn).await {
                     for i in &track.artists {
                         let a = &i.id.clone().unwrap().to_string();
@@ -490,13 +500,13 @@ async fn sync_from_spotify(conn: &sqlx::SqlitePool) {
                         )
                         .execute(conn)
                         .await;
-                        sqlx::query!("INSERT INTO spt_songs_spt_artists(spt_song_id, spt_artist_id) VALUES ($1, $2)", id, a).execute(conn).await;
+                        sqlx::query!("INSERT INTO spt_songs_spt_artists(spt_song_id, spt_artist_id) VALUES ($1, $2)", id, a).execute(conn).await.unwrap();
                     }
                 }
-                // let mut ids = data.lock().unwrap();
-                // if !ids.insert(title.to_owned()) {
-                //     println!("{}    {}      {}", id, title, artist)
-                // }
+                let mut ids = data.lock().unwrap();
+                if !ids.insert(id.to_owned()) {
+                    println!("{}    {}      {}", id, title, artist)
+                }
             }
         }
         Ok(())

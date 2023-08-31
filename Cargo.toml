@@ -26,3 +26,5 @@ rodio = {version = "0.17.1", features = ["symphonia-mp3"] }
 minimp3 = "0.5.1"
 symphonia = { version = "0.5.3", features = ["mp3"] }
 ratatu-image = {version = "0.1.1", features = ["crossterm", "sixel"] }
+rand = "0.8.5"
+base64 = "0.21.3"
