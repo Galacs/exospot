@@ -13,9 +13,9 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Span, Spans},
-    widgets::{Block, Borders, Paragraph},
-    Terminal,
+    text::{Span, Spans, Line},
+    widgets::{Block, Borders, Paragraph, ListItem, List, ListState},
+    Terminal, prelude::Rect,
 };
 use rodio::{Source, Sink};
 use rspotify::{
@@ -31,7 +31,7 @@ use std::{
     io::{self, Stdout, Read},
     process::exit,
     sync::Arc,
-    time::Duration,
+    time::Duration, vec,
 };
 use tokio::{select, sync::Mutex};
 
@@ -58,7 +58,17 @@ fn restore_terminal(
 #[derive(Debug, Clone)]
 enum App {
     Welcome,
-    Spotify(SpotifyUi),
+    Spotify((SpotifyUi, Vec<String>, StatefulList<(String, Color)>,)),
+}
+
+impl std::fmt::Debug for StatefulList<(std::string::String, Color)> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatefulList").field("state", &self.state).field("items", &self.items).finish()
+    }
+}
+
+struct States {
+    spt_list: StatefulList<(String, Color)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -74,6 +84,7 @@ pub struct SpotifyUi {
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &App,
+    mut states: &mut States,
 ) -> Result<(), Box<dyn Error>> {
     terminal.draw(|frame| {
         match app {
@@ -81,9 +92,34 @@ fn draw(
                 let greeting = Paragraph::new("Welcome to Exospot");
                 frame.render_widget(greeting, frame.size());
             }
-            App::Spotify(spt_ui) => {
+            App::Spotify((spt_ui, songs, _)) => {
                 let spt_widget = widgets::spotify::Clear(spt_ui.clone());
-                frame.render_widget(spt_widget, frame.size());
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(
+                        [
+                            Constraint::Percentage(20),
+                            Constraint::Percentage(80),
+                        ].as_ref()
+                    )
+                    .split(frame.size());
+                frame.render_widget(spt_widget, chunks[1]);
+                
+                let items: Vec<_> = states.spt_list.items.iter().map(|song| {
+                    ListItem::new(Line::from(Span::raw(&song.0))).style(Style::default().fg(song.1))
+                }).collect();
+                let list = List::new(items)
+                    .block(Block::default().title("List").borders(Borders::ALL))
+                    // .style(Style::default().fg(Color::White))
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::LightGreen)
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol(">>");
+                // frame.render_widget(list, Rect::new(0, 0, 30, frame.size().height));
+                frame.render_stateful_widget(list, chunks[0], &mut states.spt_list.state);
             }
         }
     })?;
@@ -107,6 +143,7 @@ impl DisplayTimestamp for chrono::Duration {
 async fn input(
     tx: tokio::sync::mpsc::Sender<Event>,
     update_tx: tokio::sync::watch::Sender<bool>,
+    mut states: Arc<Mutex<States>>,
 ) {
     let mut reader = EventStream::new();
     loop {
@@ -134,15 +171,19 @@ async fn ui(
     term: Arc<Mutex<Terminal<CrosstermBackend<Stdout>>>>,
     mut rx: tokio::sync::watch::Receiver<App>,
     mut update_rx: tokio::sync::watch::Receiver<bool>,
+    mut states: Arc<Mutex<States>>,
 ) {
     let mut state = rx.borrow().to_owned();
+    // let mut spt_state = StatefulList::with_items(vec![]);
+    // let mut states = Arc::new(Mutex::new(States { spt_list: spt_state }));
     loop {
         select! {
             _ = rx.changed() => state = rx.borrow().to_owned(),
             _ = update_rx.changed() => {},
         }
         let mut terminal = term.lock().await;
-        draw(&mut terminal, &state).unwrap();
+        let mut states_lck = states.lock().await;
+        draw(&mut terminal, &state, &mut states_lck).unwrap();
     }
 }
 
@@ -202,6 +243,53 @@ async fn stream_and_play_mp3(mp3_url: String, mut rx: tokio::sync::watch::Receiv
     }
 }
 
+#[derive(Clone)]
+struct StatefulList<T> {
+    state: ListState,
+    items: Vec<T>,
+}
+
+impl<T> StatefulList<T> {
+    fn with_items(items: Vec<T>) -> StatefulList<T> {
+        StatefulList {
+            state: ListState::default(),
+            items,
+        }
+    }
+
+    fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn unselect(&mut self) {
+        self.state.select(None);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Restore terminal on panic
@@ -212,6 +300,10 @@ async fn main() {
         restore_terminal(&mut terminal).unwrap();
     }));
 
+    // States init
+    let mut spt_state = StatefulList::with_items(vec![]);
+    let mut states = Arc::new(Mutex::new(States { spt_list: spt_state }));
+
     // TUI
     let  terminal = setup_terminal().unwrap();
     let  app_state: App = App::Welcome;
@@ -219,8 +311,8 @@ async fn main() {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
     let (update_tx, update_rx) = tokio::sync::watch::channel(true);
     let terminal = Arc::new(Mutex::new(terminal));
-    let task = tokio::task::spawn(ui(terminal.clone(), rx, update_rx));
-    let input_task = tokio::task::spawn(input(input_tx, update_tx));
+    let task = tokio::task::spawn(ui(terminal.clone(), rx, update_rx, states.clone()));
+    let input_task = tokio::task::spawn(input(input_tx, update_tx, states.clone()));
 
     let term = terminal.clone();
     tokio::spawn(async move {
@@ -242,8 +334,16 @@ async fn main() {
 
     let spt_songs = sqlx::query!("select * from spt_songs ORDER BY RANDOM()")
         .fetch_all(&conn)
-        .await;
-    for song in spt_songs.unwrap() {
+        .await
+        .unwrap();
+    {
+        let mut lock = states.lock().await;
+        lock.spt_list.items = spt_songs.iter().map(|song| {
+            (song.title.clone(), Color::White)
+        }).collect();
+        lock.spt_list.next();
+    }
+    for song in spt_songs {
         let artists = sqlx::query!(
             "SELECT spt_artists.name, spt_artists.id
             FROM spt_songs_spt_artists
@@ -272,14 +372,28 @@ async fn main() {
             .bytes()
             .await
             .unwrap();
-        let app_state = App::Spotify(SpotifyUi {
+        
+        let items = StatefulList::with_items(vec![
+            ("Item0".to_owned(), Color::White),
+            ("Item1".to_owned(), Color::White),
+            ("Item2".to_owned(), Color::White),
+            ("Item3".to_owned(), Color::White),
+            ("Item4".to_owned(), Color::White),
+            ("Item5".to_owned(), Color::White),
+            ("Item6".to_owned(), Color::White),
+            ("Item7".to_owned(), Color::White),
+            ("Item8".to_owned(), Color::White),
+            ("Item9".to_owned(), Color::White)]);
+
+        let state: StatefulList<(String, Color)> = items;
+        let app_state = App::Spotify((SpotifyUi {
             title: song.title.to_owned(),
             artist: song.artist.to_owned(),
             cover_img: img_buf,
             album_name: album.name.to_owned(),
             album_kind: album.kind.to_owned(),
             duration: Duration::from_millis(song.duration as u64)
-        });
+        }, vec!["salut".to_owned(); 20], state));
         let url = song.preview_url;
         tx.send(app_state).unwrap();
 
@@ -296,7 +410,13 @@ async fn main() {
                 Some(msg) = input_rx.recv() => {
                     let Event::Key(key) = msg else { continue };
                     match key.code {
-                        KeyCode::Enter => break 'outer,
+                        KeyCode::Enter => {
+                            let mut lock = states.lock().await;
+                            lock.spt_list.next();
+                            let i = lock.spt_list.state.selected().unwrap();
+                            lock.spt_list.items.get_mut(i).unwrap().1 = Color::Green;
+                            break 'outer
+                        },
                         KeyCode::Char('y') => { open::that(format!("https://www.youtube.com/results?search_query={}", urlencoding::encode(&format!("{} {}", song.artist, song.title))).to_string()).unwrap(); }
                         KeyCode::Char('p') | KeyCode::Char(' ') => { if let Some(_) = url { preview_tx.send(StreamStatus::Play).unwrap() }}
                         _ => {}

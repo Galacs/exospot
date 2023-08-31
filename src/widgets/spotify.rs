@@ -75,8 +75,8 @@ impl Widget for Clear {
         let width = (area.width as f32 * 0.20_f32) as u32;
         let conf = viuer::Config {
             width: Some(width),
-            x: (area.width as f32 * 0.5 - (width / 2) as f32) as u16,
-            y: (area.height as f32 * 0.07) as i16,
+            x: area.x + (area.width as f32 * 0.5 - (width / 2) as f32) as u16,
+            y: area.y as i16 + (area.height as f32 * 0.07) as i16,
             use_kitty: false,
             ..Default::default()
         };
