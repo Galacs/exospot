@@ -38,6 +38,7 @@ use tokio::{select, sync::Mutex};
 use viuer::{print, Config};
 
 mod symphonia_decoder;
+mod widgets;
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, Box<dyn Error>> {
     let mut stdout = io::stdout();
@@ -60,8 +61,8 @@ enum App {
     Spotify(SpotifyUi),
 }
 
-#[derive(Debug, Clone)]
-struct SpotifyUi {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct SpotifyUi {
     title: String,
     artist: String,
     cover_img: Bytes,
@@ -81,62 +82,8 @@ fn draw(
                 frame.render_widget(greeting, frame.size());
             }
             App::Spotify(spt_ui) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    // .margin(0)
-                    .constraints(
-                        [
-                            Constraint::Percentage(25),
-                            Constraint::Percentage(25),
-                            Constraint::Percentage(25),
-                            Constraint::Percentage(25),
-                        ]
-                        .as_ref(),
-                    )
-                    .split(frame.size());
-
-                let chunks2 = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints(
-                        [
-                            Constraint::Ratio(1, 4),
-                            Constraint::Ratio(2, 4),
-                            Constraint::Ratio(3, 4),
-                        ]
-                        .as_ref(),
-                    )
-                    .split(chunks[3]);
-
-                let pretty_duration = format!("{}", chrono::Duration::from_std(spt_ui.duration).unwrap().display_timestamp().unwrap());
-                let title =
-                    Paragraph::new(format!("Titre: {}\nDurée: {}", spt_ui.title, pretty_duration)).alignment(Alignment::Center);
-                frame.render_widget(title, chunks[0]);
-                let title = Paragraph::new(format!(
-                    "Artiste: {}\nAlbum: {} ({})",
-                    spt_ui.artist, spt_ui.album_name, spt_ui.album_kind
-                ))
-                .alignment(Alignment::Center);
-                frame.render_widget(title, chunks[2]);
-                let title = Paragraph::new("P pour preview").alignment(Alignment::Center);
-                frame.render_widget(title, chunks2[0]);
-                let title = Paragraph::new("Y pour ouvrir dans Youtube Search")
-                    .alignment(Alignment::Center);
-                frame.render_widget(title, chunks2[1]);
-                let title = Paragraph::new("Entrée pour aller sur la musique suivante")
-                    .alignment(Alignment::Center);
-                frame.render_widget(title, chunks2[2]);
-
-                let img = image::load_from_memory(&spt_ui.cover_img)
-                    .expect("Data from stdin could not be decoded.");
-                let width = (frame.size().width as f32 * 0.20_f32) as u32;
-                let conf = Config {
-                    width: Some(width),
-                    x: (frame.size().width as f32 * 0.5 - (width/2) as f32) as u16,
-                    y: (frame.size().height as f32 * 0.07) as i16,
-                    use_kitty: false,
-                    ..Default::default()
-                };
-                print(&img, &conf).expect("Image printing failed.");
+                let spt_widget = widgets::spotify::Clear(spt_ui.clone());
+                frame.render_widget(spt_widget, frame.size());
             }
         }
     })?;
